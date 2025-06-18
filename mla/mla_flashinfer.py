@@ -3,7 +3,7 @@ import flashinfer
 import time
 import torch.nn as nn
 
-def test_mla_prefill():
+def test_flashinfer_mla_prefill():
     num_qo_heads = 128
     num_kv_heads = 128
     head_dim = 128
@@ -43,14 +43,16 @@ def test_mla_prefill():
     torch.cuda.synchronize()
     end=time.time()
 
-    print(f"time_ave= {(1000000*(end-start)/loop):.3f} us")
+    print(f"  flashinfer.BatchPrefillWithRaggedKVCacheWrapper")
+    print(f"    Latency: {(1000000*(end-start)/loop):.3f} us")
 
 
-def test_mla_decode(num_local_heads = 128,
-                    batch_size = 2,
-                    head_dim_ckv = 512,
-                    head_dim_kpe = 64,
-                    page_size = 32):
+def test_flashinfer_mla_decode(
+        num_local_heads = 128,
+        batch_size = 2,
+        head_dim_ckv = 512,
+        head_dim_kpe = 64,
+        page_size = 32):
 
     mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0),
@@ -79,21 +81,21 @@ def test_mla_decode(num_local_heads = 128,
     torch.cuda.synchronize()
     end=time.time()
 
-    print(f"time_ave= {(1000000*(end-start)/loop):.3f} us")
+    print(f"  flashinfer.mla.BatchMLAPagedAttentionWrapper")
+    print(f"    Latency: {(1000000*(end-start)/loop):.3f} us")
 
 
-def test_linear(batch_size, in_features, out_features, device='cuda', num_warmup=10, num_iter=1000):
-    # 初始化模型和输入
+def test_torch_linear(batch_size, in_features, out_features, device='cuda', num_warmup=10, num_iter=1000):
     linear = nn.Linear(in_features, out_features, dtype=torch.float16).to(device).eval()
     x = torch.randn(batch_size, in_features, dtype=torch.float16, device=device)
 
-    # 预热 (避免冷启动误差)
+    # warm-up
     with torch.no_grad():
         for _ in range(num_warmup):
             _ = linear(x)
     torch.cuda.synchronize() if device == 'cuda' else None
 
-    # 正式测试
+    # test
     start_time = time.time()
     with torch.no_grad():
         for _ in range(num_iter):
@@ -101,58 +103,57 @@ def test_linear(batch_size, in_features, out_features, device='cuda', num_warmup
     torch.cuda.synchronize() if device == 'cuda' else None
     elapsed = (time.time() - start_time) * 1000000 / num_iter  # 平均毫秒
 
-    print(f"nn.Linear({in_features}, {out_features}) Batch: {batch_size}\n"
-          f"  Latency: {elapsed:.3f} us | ")
+    print(f"  nn.Linear({in_features}, {out_features}) Batch: {batch_size}\n"
+          f"    Latency: {elapsed:.3f} us | ")
 
 
-def test_bmm(batch_size, m, n, p, device='cuda', num_warmup=10, num_iter=1000):
-    """测试 torch.bmm 矩阵乘法性能
-
-    参数:
-        batch_size: 批次大小
-        m: 左矩阵行数
-        n: 左矩阵列数/右矩阵行数
-        p: 右矩阵列数
-        device: 计算设备 ('cuda' 或 'cpu')
-        num_warmup: 预热迭代次数
-        num_iter: 正式测试迭代次数
+def test_torch_bmm(batch_size, m, n, p, device='cuda', num_warmup=10, num_iter=1000):
+    """torch.bmm
+        device: 'cuda' or 'cpu'
+        num_warmup
+        num_iter
     """
-    # 初始化输入张量 (符合 bmm 的 (b,m,n) * (b,n,p) 形状要求)
     a = torch.randn(batch_size, m, n, dtype=torch.float16, device=device)
     b = torch.randn(batch_size, n, p, dtype=torch.float16, device=device)
 
-    # 预热
+    # warm up
     for _ in range(num_warmup):
         _ = torch.bmm(a, b)
     torch.cuda.synchronize() if device == 'cuda' else None
 
-    # 正式测试
+    # test
     start_time = time.time()
     for _ in range(num_iter):
         _ = torch.bmm(a, b)
     torch.cuda.synchronize() if device == 'cuda' else None
     elapsed = (time.time() - start_time) * 1000000 / num_iter  # 平均毫秒
 
-    print(f"torch.bmm({m}x{n}, {n}x{p}) Batch: {batch_size}\n"
-          f"  Latency: {elapsed:.3f} us | ")
+    print(f"  torch.bmm({m}x{n}, {n}x{p}) Batch: {batch_size}\n"
+          f"    Latency: {elapsed:.3f} us | ")
 
 
-print("Prefill")
-test_linear(512, 7168, 2112)  # qkv_down
-test_linear(512, 1536, 128*192) # q_up
-test_linear(512, 512, 128*256) # kv_up
-print("prefill_mla")
-test_mla_prefill()
-test_linear(512, 128*128, 7168) # o_proj
+def prefill_fp16_with_torch():
+    print("Prefill_fp16_with_torch")
+    test_torch_linear(512, 7168, 2112)  # qkv_down
+    test_torch_linear(512, 1536, 128*192) # q_up
+    test_torch_linear(512, 512, 128*256) # kv_up
+    test_flashinfer_mla_prefill()
+    test_torch_linear(512, 128*128, 7168) # o_proj
 
+
+def decoding_fp16_with_torch(bs=1):
+    print(f"Decoding_fp16_with_torch b={bs}")
+    test_torch_linear(bs, 7168, 2112) # qkv_down
+    test_torch_linear(bs, 1536, 128*192) # q_up
+    test_torch_bmm(128, bs, 128, 512) # q_wuk
+    test_flashinfer_mla_decode(batch_size = bs)
+    test_torch_bmm(128, bs, 512, 128) # attn_o_wuv
+    test_torch_linear(bs, 128*128, 7168) # o_proj
+    print("")
+
+
+# main
+prefill_fp16_with_torch()
 print("")
 for bs in [1,2,4,8]:
-    print(f"Decode b={bs}")
-    test_linear(bs, 7168, 2112) # qkv_down
-    test_linear(bs, 1536, 128*192) # q_up
-    test_bmm(128, bs, 128, 512) # q_wuk
-    print(f"decode mla")
-    test_mla_decode(batch_size = bs)
-    test_bmm(128, bs, 512, 128) # attn_o_wuv
-    test_linear(bs, 128*128, 7168) # o_proj
-    print("")
+    decoding_fp16_with_torch(bs)
