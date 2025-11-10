@@ -1,3 +1,7 @@
+# test on
+#   torch 2.5.1
+#   flashinfer-python  0.2.6.post1 (build from source)
+#
 import torch
 import flashinfer
 import time
@@ -52,20 +56,22 @@ def test_flashinfer_mla_decode(
         batch_size = 2,
         head_dim_ckv = 512,
         head_dim_kpe = 64,
-        page_size = 32):
+        page_size = 32,
+        kvlen = 999
+    ):
 
     mla_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0),
         backend="fa2"
     )
     q_indptr = torch.arange(0, batch_size + 1).to(0).int() # for decode, each query length is 1
-    kv_lens = torch.full((batch_size,), 999, dtype=torch.int32).to(0)
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * 999
-    kv_indices = torch.arange(0, batch_size * 999).to(0).int()
+    kv_lens = torch.full((batch_size,), kvlen, dtype=torch.int32).to(0)
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kvlen
+    kv_indices = torch.arange(0, batch_size * kvlen).to(0).int()
     q_nope = torch.randn(batch_size * 1, num_local_heads, head_dim_ckv, dtype=torch.bfloat16, device="cuda")
     q_pe = torch.zeros(batch_size * 1, num_local_heads, head_dim_kpe, dtype=torch.bfloat16, device="cuda")
-    ckv = torch.randn(batch_size * 999, 1, head_dim_ckv, dtype=torch.bfloat16, device="cuda")
-    kpe = torch.zeros(batch_size * 999, 1, head_dim_kpe, dtype=torch.bfloat16, device="cuda")
+    ckv = torch.randn(batch_size * kvlen, 1, head_dim_ckv, dtype=torch.bfloat16, device="cuda")
+    kpe = torch.zeros(batch_size * kvlen, 1, head_dim_kpe, dtype=torch.bfloat16, device="cuda")
     sm_scale = 1.0 / ((128 + 64) ** 0.5)  # use head dimension before matrix absorption
     mla_wrapper.plan(q_indptr, kv_indptr, kv_indices, kv_lens,
         num_local_heads, head_dim_ckv, head_dim_kpe, page_size,
@@ -132,21 +138,21 @@ def test_torch_bmm(batch_size, m, n, p, device='cuda', num_warmup=10, num_iter=1
           f"    Latency: {elapsed:.3f} us | ")
 
 
-def prefill_fp16_with_torch():
-    print("Prefill_fp16_with_torch")
-    test_torch_linear(512, 7168, 2112)  # qkv_down
-    test_torch_linear(512, 1536, 128*192) # q_up
-    test_torch_linear(512, 512, 128*256) # kv_up
+def prefill_fp16_with_torch(inputlen=512):
+    print(f"Prefill_fp16_with_torch inputlen={inputlen}")
+    test_torch_linear(inputlen, 7168, 2112)  # qkv_down
+    test_torch_linear(inputlen, 1536, 128*192) # q_up
+    test_torch_linear(inputlen, 512, 128*256) # kv_up
     test_flashinfer_mla_prefill()
-    test_torch_linear(512, 128*128, 7168) # o_proj
+    test_torch_linear(inputlen, 128*128, 7168) # o_proj
 
 
-def decoding_fp16_with_torch(bs=1):
-    print(f"Decoding_fp16_with_torch b={bs}")
+def decoding_fp16_with_torch(bs=1,kvlen=512):
+    print(f"Decoding_fp16_with_torch b={bs} kvlen={kvlen}")
     test_torch_linear(bs, 7168, 2112) # qkv_down
     test_torch_linear(bs, 1536, 128*192) # q_up
     test_torch_bmm(128, bs, 128, 512) # q_wuk
-    test_flashinfer_mla_decode(batch_size = bs)
+    test_flashinfer_mla_decode(batch_size = bs, kvlen=kvlen)
     test_torch_bmm(128, bs, 512, 128) # attn_o_wuv
     test_torch_linear(bs, 128*128, 7168) # o_proj
     print("")
@@ -155,5 +161,6 @@ def decoding_fp16_with_torch(bs=1):
 # main
 prefill_fp16_with_torch()
 print("")
-for bs in [1,2,4,8]:
-    decoding_fp16_with_torch(bs)
+for bs in [1,4]:
+    for kvlen in [999,1999,15999]:
+        decoding_fp16_with_torch(bs,kvlen)
